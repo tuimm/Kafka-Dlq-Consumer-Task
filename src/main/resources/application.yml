@@ -1,0 +1,7 @@
+
+spring:
+  application:
+    name: DlqTaskConsumer
+logging:
+  level:
+    com.tui: debug
