@@ -1,0 +1,197 @@
+image: 961225121166.dkr.ecr.eu-central-1.amazonaws.com/deploybasetools:v.0.2.1
+
+variables:
+  NAME: kafka-dlq-consumer-task
+  DOCKER_AUTH_CONFIG: '{ "credsStore": "ecr-login" }'
+  DOCKER_REPOSITORY: tui/$NAME
+  # This will supress any download for dependencies and plugins or upload messages which would clutter the console log.
+  # `showDateTime` will show the passed time in milliseconds. You need to specify `--batch-mode` to make this work.
+  MAVEN_OPTS:
+    "-Dmaven.repo.local=.m2/repository -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=WARN\
+    \ -Dorg.slf4j.simpleLogger.showDateTime=true -Djava.awt.headless=true"
+  MAVEN_CLI_OPTS: "--batch-mode --errors --fail-at-end --show-version -U -s settings.xml"
+  # AWS
+  AWS_SERVICE_NAME: $NAME
+  AWS_DEFAULT_REGION: eu-central-1
+  SONAR_PROJECT_KEY: com.tui.customer:$NAME
+
+# Cache downloaded dependencies and plugins between builds.
+# To keep cache across branches add 'key: "$CI_JOB_REF_NAME"'
+cache:
+  paths:
+    - .m2/repository
+
+# Before scripts
+before_script: &before_script_global
+  - export VERSION=${CI_PIPELINE_ID}-${CI_BUILD_REF:0:8}
+  - export BASE_IMAGE=${DOCKER_REGISTRY_URL}/${DOCKER_REPOSITORY}
+  - export IMAGE=${BASE_IMAGE}:${VERSION}
+
+# Stages
+stages:
+  - build:maven
+  - build:docker
+  - test
+  - deploy
+  - run
+
+# Workflow
+workflow:
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^renovate\/configure$/
+      when: never
+    - if: $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME =~ /^renovate\/configure$/
+      when: never
+    - if: $CI_MERGE_REQUEST_TITLE =~ /^Draft/
+      when: never
+    - when: always
+
+# =============================================================================
+
+.test:
+  variables:
+    ENVIRONMENT: test
+    COMMIT_BRANCH: develop
+  environment:
+    name: test
+
+.pre:
+  variables:
+    ENVIRONMENT: pre
+    COMMIT_BRANCH: ^release\/.*$
+  environment:
+    name: pre
+
+.prod:
+  variables:
+    ENVIRONMENT: prod
+    COMMIT_BRANCH: master
+  environment:
+    name: prod
+
+.default_rules:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: never
+    - if: $CI_COMMIT_BRANCH =~ /develop|^release\/.*$|master/
+
+.deploy_rules:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: never
+    - if: $CI_COMMIT_BRANCH == $COMMIT_BRANCH
+
+.task_rules:
+  rules:
+    - if: $CI_COMMIT_BRANCH == $COMMIT_BRANCH && $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_COMMIT_BRANCH == $COMMIT_BRANCH
+      when: manual
+
+.assume_role:
+  before_script:
+    - *before_script_global
+    - varname="$(echo ${ENVIRONMENT} | tr '[:lower:]' '[:upper:]')_TARGET_ROLE" &&
+      export TARGET_ROLE=$(eval "echo \$${varname}")
+    - ASSUME_ROLE=$(aws sts assume-role --role-arn ${TARGET_ROLE} --role-session-name kafka-dlq-consumer-task)
+    - export AWS_ACCESS_KEY_ID=$(echo ${ASSUME_ROLE} | jq -r .Credentials.AccessKeyId)
+    - export AWS_SECRET_ACCESS_KEY=$(echo ${ASSUME_ROLE} | jq -r .Credentials.SecretAccessKey)
+    - export AWS_SESSION_TOKEN=$(echo ${ASSUME_ROLE} | jq -r .Credentials.SessionToken)
+
+.deploy:
+  extends: .assume_role
+  stage: deploy
+  script:
+    - TASK_DEFINITION=$(aws ecs describe-task-definition --task-definition "${AWS_SERVICE_NAME}" --region "${AWS_DEFAULT_REGION}")
+    - NEW_TASK_DEFINTIION=$(echo $TASK_DEFINITION | jq --arg IMAGE "${IMAGE}" '.taskDefinition | .containerDefinitions[0].image = $IMAGE | del(.taskDefinitionArn) | del(.revision) | del(.status) | del(.requiresAttributes) | del(.compatibilities)')
+    - echo "NEW_TASK_DEFINTIION" ${NEW_TASK_DEFINTIION}
+    - echo "Registering new container definition..."
+    - aws ecs register-task-definition --region "${AWS_DEFAULT_REGION}" --cli-input-json "$NEW_TASK_DEFINTIION"
+
+.run:
+  extends: .assume_role
+  stage: run
+  script:
+    - varname="$(echo ${ENVIRONMENT} | tr '[:lower:]' '[:upper:]')_AWS_SUBNET" &&
+      export AWS_SUBNET=$(eval "echo \$${varname}")
+    - varname="$(echo ${ENVIRONMENT} | tr '[:lower:]' '[:upper:]')_AWS_SECURITY_GROUP" &&
+      export AWS_SECURITY_GROUP=$(eval "echo \$${varname}")
+    - echo "Running task..."
+    - |
+      aws ecs run-task \
+        --count 1 \
+        --launch-type FARGATE \
+        --task-definition ${AWS_SERVICE_NAME}  \
+        --network-configuration "awsvpcConfiguration={subnets=[${AWS_SUBNET}],securityGroups=[${AWS_SECURITY_GROUP}]}"
+
+# =============================================================================
+
+maven:build:
+  extends: .default_rules
+  stage: build:maven
+  image: 961225121166.dkr.ecr.eu-central-1.amazonaws.com/base/maven:3.8.5-jdk-11-slim
+  before_script: []
+  script:
+      - mvn $MAVEN_CLI_OPTS clean compile package -DskipTests -Dmaven.test.skip=true
+  artifacts:
+    when: on_success
+    paths:
+      - "target/"
+      - "target/*.jar"
+
+docker:build:
+  extends: .default_rules
+  stage: build:docker
+  variables:
+    AWS_ACCESS_KEY_ID: ${TUIDS_SHARED_AWS_ACCESS_KEY_ID}
+    AWS_SECRET_ACCESS_KEY: ${TUIDS_SHARED_AWS_SECRET_ACCESS_KEY}
+  dependencies:
+    - maven:build
+  script:
+    - aws ecr get-login-password --region eu-central-1 | docker login --username AWS --password-stdin ${DOCKER_REGISTRY_URL}
+    - echo "${BASE_IMAGE} -- ${IMAGE} -- ${AWS_ACCESS_KEY_ID} -- ${TUIDS_SHARED_AWS_ACCESS_KEY_ID}"
+    - docker build -t ${IMAGE} .
+    - docker push ${IMAGE}
+    - '[[ ${CI_COMMIT_REF_NAME} = "develop" ]] && docker tag ${IMAGE} ${BASE_IMAGE}:test && docker push ${BASE_IMAGE}:test && echo "Pushed test image"'
+    - '[[ ${CI_COMMIT_REF_NAME} =~ "^release\/.*$" ]] && docker tag ${IMAGE} ${BASE_IMAGE}:pre && docker push ${BASE_IMAGE}:pre && echo "Pushed pre image"'
+    - '[[ ${CI_COMMIT_REF_NAME} = "master" ]] && docker tag ${IMAGE} ${BASE_IMAGE}:prod && docker push ${BASE_IMAGE}:prod && echo "Pushed prod image"'
+    - echo "Pushed ${IMAGE}"
+
+## ==============================================================================
+
+deploy:test:
+  extends:
+    - .test
+    - .deploy
+    - .deploy_rules
+
+deploy:pre:
+  extends:
+    - .pre
+    - .deploy
+    - .deploy_rules
+
+deploy:prod:
+  extends:
+    - .prod
+    - .deploy
+    - .deploy_rules
+
+# =============================================================================
+
+run:test:
+  extends:
+    - .test
+    - .run
+    - .task_rules
+
+run:pre:
+  extends:
+    - .pre
+    - .run
+    - .task_rules
+
+run:prod:
+  extends:
+    - .prod
+    - .run
+    - .task_rules

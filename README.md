@@ -30,5 +30,42 @@ re-insert it into the source origin once the problem that caused the error has b
 
 ## How to launch the task
 
+Fist step is configure your service and the Gitlab project to allow it to be deployed.
 
-**--TO BE DEFINED--**
+### Configure the project
+
+The next environment variables can be configured:
+
+* BOOTSTRAP_SERVERS
+* GROUP_ID
+* TOPIC
+
+If they are not defined, the service will use the ones configured by default.
+
+### Configure Gitlab Project
+
+Because the pipeline allows execution for multiple environments, the configuration parameters also must be by each 
+environment you need to deploy.
+The Gitlab CI/CD pipeline require the following parameters to be fully executed according the environment:
+
+| Environment Variable                  | Description |
+| :---                                  | :---- |
+| **\<ENVIRONMENT>_TARGET_ROLE**        | This value requires the role ARN deployed by IaC which allows create new task definitions and run Fargate jobs |  
+| **\<ENVIRONMENT>_AWS_SUBNET**         | To run Fargate job you must specify a subnet list | 
+| **\<ENVIRONMENT>_AWS_SECURITY_GROUP** | A security group list is required To run Fargate tasks | 
+
+Where the <ENVIRONMENT> typically can take this values: TEST, PRE, PROD.
+
+### Pipelines
+
+Has been configured a `gitlab-ci` with two pipeline flows: 
+
+* One of them to package your Java code and build the docker image, update the AWS task definition  deployed by 
+  [IaC project](https://source.tui/dx/fulfillment/ermes/iac-kafka-dlq-consumer-task) with the docker image generated 
+  by the previous job and run optionally the AWS Fargate task. This pipeline is enabled for each push to the repository.
+  ![Full pipeline](assets/pipeline_1.png)
+* The other one runs automatically the AWS Fargate task. This pipeline is only activated using the web interface. 
+  ![Full pipeline](assets/pipeline_2.png)
+
+
+
