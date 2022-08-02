@@ -2,6 +2,19 @@
 spring:
   application:
     name: DlqTaskConsumer
+
+  kafka:
+    topics: foo
+    consumer:
+      auto-offset-reset: latest
+      bootstrap-servers: ${BOOTSTRAP_SERVERS:localhost:9092}
+      group-id: ${spring.application.name}
+      enable-auto-commit: false
+      value-deserializer: org.apache.kafka.common.serialization.ByteArrayDeserializer
+      key-deserializer: org.apache.kafka.common.serialization.ByteArrayDeserializer
+
+
 logging:
   level:
     com.tui: debug
+

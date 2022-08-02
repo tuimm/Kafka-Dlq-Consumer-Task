@@ -1,5 +1,3 @@
-image: 961225121166.dkr.ecr.eu-central-1.amazonaws.com/deploybasetools:v.0.2.1
-
 variables:
   NAME: kafka-dlq-consumer-task
   DOCKER_AUTH_CONFIG: '{ "credsStore": "ecr-login" }'
@@ -14,6 +12,7 @@ variables:
   AWS_SERVICE_NAME: $NAME
   AWS_DEFAULT_REGION: eu-central-1
   SONAR_PROJECT_KEY: com.tui.customer:$NAME
+  AWS_CLUSTER: dx-${ENVIRONMENT}-ecs-digital_service-01
 
 # Cache downloaded dependencies and plugins between builds.
 # To keep cache across branches add 'key: "$CI_JOB_REF_NAME"'
@@ -22,18 +21,20 @@ cache:
     - .m2/repository
 
 # Before scripts
-before_script: &before_script_global
+before_script:
   - export VERSION=${CI_PIPELINE_ID}-${CI_BUILD_REF:0:8}
   - export BASE_IMAGE=${DOCKER_REGISTRY_URL}/${DOCKER_REPOSITORY}
-  - export IMAGE=${BASE_IMAGE}:${VERSION}
+  - export QA_VERSION=$(echo ${CI_MERGE_REQUEST_SOURCE_BRANCH_NAME} | sed s/\\//_/)
+  - export QA_IMAGE=${CI_REGISTRY_IMAGE}:${QA_VERSION}
 
 # Stages
 stages:
   - build:maven
+  - analysis:maven
+  - analysis:sonar
   - build:docker
   - test
   - deploy
-  - run
 
 # Workflow
 workflow:
@@ -48,150 +49,188 @@ workflow:
 
 # =============================================================================
 
-.test:
-  variables:
-    ENVIRONMENT: test
-    COMMIT_BRANCH: develop
-  environment:
-    name: test
+.base_job:
+  image: 961225121166.dkr.ecr.eu-central-1.amazonaws.com/deploybasetools:v.0.2.1
+  allow_failure: false
+  dependencies: []
 
-.pre:
-  variables:
-    ENVIRONMENT: pre
-    COMMIT_BRANCH: ^release\/.*$
-  environment:
-    name: pre
-
-.prod:
-  variables:
-    ENVIRONMENT: prod
-    COMMIT_BRANCH: master
-  environment:
-    name: prod
-
-.default_rules:
+.maven_base_job:
+  extends: .base_job
+  image: 961225121166.dkr.ecr.eu-central-1.amazonaws.com/base/maven:3.8.5-jdk-11-slim
+  before_script: []
+  script:
+    - mvn $MAVEN_CLI_OPTS $EXTRA_MAVEN_CLI_OPTS
+  dependencies:
+    - maven:build
+  artifacts:
+    when: on_success
+    paths:
+      - target/
   rules:
-    - if: $CI_PIPELINE_SOURCE == "web"
-      when: never
-    - if: $CI_COMMIT_BRANCH =~ /develop|^release\/.*$|master/
+    - when: on_success
 
-.deploy_rules:
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "web"
-      when: never
-    - if: $CI_COMMIT_BRANCH == $COMMIT_BRANCH
+.sonar_base_job:
+  extends: .base_job
+  image: 961225121166.dkr.ecr.eu-central-1.amazonaws.com/base/maven:3.8.5-jdk-11-slim
+  stage: analysis:sonar
+  variables:
+    EXTRA_MAVEN_CLI_OPTS: "verify sonar:sonar
+      -Dsonar.host.url=$SONAR_URL
+      -Dsonar.language=java
+      -Dsonar.projectName=$CI_PROJECT_NAME
+      -Dsonar.projectVersion=$CI_BUILD_ID
+      -Dsonar.projectKey=$SONAR_PROJECT_KEY
+      -Dsonar.gitlab.ping_user=true
+      -Dsonar.gitlab.project_id=$CI_PROJECT_ID
+      -Dsonar.gitlab.commit_sha=$CI_BUILD_REF
+      -Dsonar.gitlab.ref_name=$CI_BUILD_REF_NAME
+      -Dsonar.qualitygate.wait=true
+      -DskipTests
+      -Dmaven.test.skip=true"
+  before_script: []
+  script:
+    - mvn $MAVEN_CLI_OPTS $EXTRA_MAVEN_CLI_OPTS
+  dependencies:
+    - maven:ut
+    - maven:it
 
-.task_rules:
-  rules:
-    - if: $CI_COMMIT_BRANCH == $COMMIT_BRANCH && $CI_PIPELINE_SOURCE == "web"
-    - if: $CI_COMMIT_BRANCH == $COMMIT_BRANCH
-      when: manual
+.docker_base_job:
+  extends: .base_job
+  stage: build:docker
+  dependencies:
+    - maven:build
+  script:
+    - export AWS_ACCESS_KEY_ID=${TUIDS_SHARED_AWS_ACCESS_KEY_ID}
+    - export AWS_SECRET_ACCESS_KEY=${TUIDS_SHARED_AWS_SECRET_ACCESS_KEY}
+    - aws ecr get-login-password --region eu-central-1 | docker login --username AWS --password-stdin ${DOCKER_REGISTRY_URL}
 
-.assume_role:
-  before_script:
-    - *before_script_global
-    - varname="$(echo ${ENVIRONMENT} | tr '[:lower:]' '[:upper:]')_TARGET_ROLE" &&
-      export TARGET_ROLE=$(eval "echo \$${varname}")
-    - ASSUME_ROLE=$(aws sts assume-role --role-arn ${TARGET_ROLE} --role-session-name kafka-dlq-consumer-task)
-    - export AWS_ACCESS_KEY_ID=$(echo ${ASSUME_ROLE} | jq -r .Credentials.AccessKeyId)
-    - export AWS_SECRET_ACCESS_KEY=$(echo ${ASSUME_ROLE} | jq -r .Credentials.SecretAccessKey)
-    - export AWS_SESSION_TOKEN=$(echo ${ASSUME_ROLE} | jq -r .Credentials.SessionToken)
-
-.deploy:
-  extends: .assume_role
+.deploy_base_job:
+  extends: .base_job
   stage: deploy
   script:
-    - TASK_DEFINITION=$(aws ecs describe-task-definition --task-definition "${AWS_SERVICE_NAME}" --region "${AWS_DEFAULT_REGION}")
-    - NEW_TASK_DEFINTIION=$(echo $TASK_DEFINITION | jq --arg IMAGE "${IMAGE}" '.taskDefinition | .containerDefinitions[0].image = $IMAGE | del(.taskDefinitionArn) | del(.revision) | del(.status) | del(.requiresAttributes) | del(.compatibilities)')
-    - echo "NEW_TASK_DEFINTIION" ${NEW_TASK_DEFINTIION}
+    - export AWS_ACCESS_KEY_ID=${TUIDS_TEST_AWS_ACCESS_KEY_ID}
+    - export AWS_SECRET_ACCESS_KEY=${TUIDS_TEST_AWS_SECRET_ACCESS_KEY}
+    - export AWS_CLUSTER=${AWS_CLUSTER_TEST}
+    - echo "cluster service image" ${AWS_CLUSTER} ${AWS_SERVICE_NAME} ${IMAGE}
+    - TASK_DEFINITION=$(aws ecs describe-task-definition --task-definition "$AWS_SERVICE_NAME" --region "${AWS_DEFAULT_REGION}")
+    - NEW_CONTAINER_DEFINITION=$(echo $TASK_DEFINITION | jq --arg IMAGE1 "${IMAGE}" '.taskDefinition.containerDefinitions[0].image = $IMAGE1 | .taskDefinition.containerDefinitions')
+    - echo "NEW_CONTAINER_DEFINITION" ${NEW_CONTAINER_DEFINITION}
     - echo "Registering new container definition..."
-    - aws ecs register-task-definition --region "${AWS_DEFAULT_REGION}" --cli-input-json "$NEW_TASK_DEFINTIION"
-
-.run:
-  extends: .assume_role
-  stage: run
-  script:
-    - varname="$(echo ${ENVIRONMENT} | tr '[:lower:]' '[:upper:]')_AWS_SUBNET" &&
-      export AWS_SUBNET=$(eval "echo \$${varname}")
-    - varname="$(echo ${ENVIRONMENT} | tr '[:lower:]' '[:upper:]')_AWS_SECURITY_GROUP" &&
-      export AWS_SECURITY_GROUP=$(eval "echo \$${varname}")
-    - echo "Running task..."
-    - |
-      aws ecs run-task \
-        --count 1 \
-        --launch-type FARGATE \
-        --task-definition ${AWS_SERVICE_NAME}  \
-        --network-configuration "awsvpcConfiguration={subnets=[${AWS_SUBNET}],securityGroups=[${AWS_SECURITY_GROUP}]}"
+    - aws ecs register-task-definition --region "${AWS_DEFAULT_REGION}" --family "${AWS_SERVICE_NAME}" --container-definitions "${NEW_CONTAINER_DEFINITION}"
+    - echo "Updating the service..."
+    - aws ecs update-service --region "${AWS_DEFAULT_REGION}" --cluster "${AWS_CLUSTER}" --service "${AWS_SERVICE_NAME}" --task-definition "${AWS_SERVICE_NAME}"
 
 # =============================================================================
 
 maven:build:
-  extends: .default_rules
+  extends: .maven_base_job
   stage: build:maven
-  image: 961225121166.dkr.ecr.eu-central-1.amazonaws.com/base/maven:3.8.5-jdk-11-slim
-  before_script: []
-  script:
-      - mvn $MAVEN_CLI_OPTS clean compile package -DskipTests -Dmaven.test.skip=true
+  dependencies: []
+  variables:
+    EXTRA_MAVEN_CLI_OPTS: "clean compile package -DskipTests -Dmaven.test.skip=true"
   artifacts:
     when: on_success
     paths:
       - "target/"
       - "target/*.jar"
 
-docker:build:
-  extends: .default_rules
-  stage: build:docker
+maven:ut:
+  extends: .maven_base_job
+  stage: analysis:maven
   variables:
-    AWS_ACCESS_KEY_ID: ${TUIDS_SHARED_AWS_ACCESS_KEY_ID}
-    AWS_SECRET_ACCESS_KEY: ${TUIDS_SHARED_AWS_SECRET_ACCESS_KEY}
-  dependencies:
-    - maven:build
-  script:
-    - aws ecr get-login-password --region eu-central-1 | docker login --username AWS --password-stdin ${DOCKER_REGISTRY_URL}
-    - echo "${BASE_IMAGE} -- ${IMAGE} -- ${AWS_ACCESS_KEY_ID} -- ${TUIDS_SHARED_AWS_ACCESS_KEY_ID}"
-    - docker build -t ${IMAGE} .
-    - docker push ${IMAGE}
-    - '[[ ${CI_COMMIT_REF_NAME} = "develop" ]] && docker tag ${IMAGE} ${BASE_IMAGE}:test && docker push ${BASE_IMAGE}:test && echo "Pushed test image"'
-    - '[[ ${CI_COMMIT_REF_NAME} =~ "^release\/.*$" ]] && docker tag ${IMAGE} ${BASE_IMAGE}:pre && docker push ${BASE_IMAGE}:pre && echo "Pushed pre image"'
-    - '[[ ${CI_COMMIT_REF_NAME} = "master" ]] && docker tag ${IMAGE} ${BASE_IMAGE}:prod && docker push ${BASE_IMAGE}:prod && echo "Pushed prod image"'
-    - echo "Pushed ${IMAGE}"
+    EXTRA_MAVEN_CLI_OPTS: "validate verify package -PunitTests"
 
-## ==============================================================================
-
-deploy:test:
-  extends:
-    - .test
-    - .deploy
-    - .deploy_rules
-
-deploy:pre:
-  extends:
-    - .pre
-    - .deploy
-    - .deploy_rules
-
-deploy:prod:
-  extends:
-    - .prod
-    - .deploy
-    - .deploy_rules
+maven:it:
+  extends: .maven_base_job
+  stage: analysis:maven
+  variables:
+    EXTRA_MAVEN_CLI_OPTS: "validate verify package -PintegrationTests"
 
 # =============================================================================
 
-run:test:
-  extends:
-    - .test
-    - .run
-    - .task_rules
+sonarqube:feature-analysis:
+  extends: .sonar_base_job
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^feature\/.*$/
+    - if: $CI_MERGE_REQUEST_IID
 
-run:pre:
-  extends:
-    - .pre
-    - .run
-    - .task_rules
+sonarqube:analysis:
+  extends: .sonar_base_job
+  before_script:
+    - export EXTRA_MAVEN_CLI_OPTS="${EXTRA_MAVEN_CLI_OPTS} -Dsonar.analysis.mode=publish"
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /develop|^release\/.*$|master/
 
-run:prod:
-  extends:
-    - .prod
-    - .run
-    - .task_rules
+# ==============================================================================
+
+docker:build:
+  extends: .docker_base_job
+  after_script:
+    - export IMAGE="${BASE_IMAGE}:${VERSION}"
+    - docker build -t ${IMAGE} .
+    - docker tag ${IMAGE} ${BASE_IMAGE}:test
+    - docker tag ${IMAGE} ${BASE_IMAGE}:pre
+    - docker tag ${IMAGE} ${BASE_IMAGE}:prod
+    - docker push ${IMAGE}
+    - '[ ${CI_COMMIT_REF_NAME} = "develop" ] && docker push ${BASE_IMAGE}:test'
+    - '[ ${CI_COMMIT_REF_NAME} =~ "^release\/.*$" ] && docker push ${BASE_IMAGE}:pre'
+    - '[ ${CI_COMMIT_REF_NAME} = "master" ] && docker push ${BASE_IMAGE}:prod'
+    - echo "Pushed ${IMAGE}"
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /develop|^release\/.*$|master/
+    - if: $CI_MERGE_REQUEST_IID
+      when: never
+
+docker:build:qa:
+  extends: .docker_base_job
+  after_script:
+    - echo "QA_VERSION=${QA_VERSION}" >> build.env
+    - echo "QA_IMAGE=${QA_IMAGE}" >> build.env
+    - docker build -t ${QA_IMAGE} .
+    - docker login -u "${CI_REGISTRY_USER}" -p "${CI_REGISTRY_PASSWORD}" "${CI_REGISTRY}"
+    - docker push ${QA_IMAGE}
+  artifacts:
+    reports:
+      dotenv: build.env
+  rules:
+    - if: $CI_MERGE_REQUEST_IID
+
+# ==============================================================================
+
+deploy:test:
+  extends: .deploy_base_job
+  variables:
+    AWS_ACCESS_KEY_ID: ${TUIDS_TEST_AWS_ACCESS_KEY_ID}
+    AWS_SECRET_ACCESS_KEY: ${TUIDS_TEST_AWS_SECRET_ACCESS_KEY}
+    ENVIRONMENT: test
+  environment:
+    name: test
+    url: http://${NAME}.test.tui-dx.com
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+
+deploy:pre:
+  extends: .deploy_base_job
+  variables:
+    AWS_ACCESS_KEY_ID: ${TUIDS_PRE_AWS_ACCESS_KEY_ID}
+    AWS_SECRET_ACCESS_KEY: ${TUIDS_PRE_AWS_SECRET_ACCESS_KEY}
+    ENVIRONMENT: pre
+  environment:
+    name: pre
+    url: http://${NAME}.pre.tui-dx.com
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^release\/.*$/
+
+deploy:prod:
+  extends: .deploy_base_job
+  variables:
+    AWS_ACCESS_KEY_ID: ${TUIDS_PROD_AWS_ACCESS_KEY_ID}
+    AWS_SECRET_ACCESS_KEY: ${TUIDS_PROD_AWS_SECRET_ACCESS_KEY}
+    ENVIRONMENT: prod
+  environment:
+    name: prod
+    url: http://${NAME}.tui-dx.com
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master"
+
+# =============================================================================

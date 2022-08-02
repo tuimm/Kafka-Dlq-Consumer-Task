@@ -9,6 +9,7 @@ import org.apache.kafka.common.PartitionInfo;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.WakeupException;
 import org.apache.kafka.common.serialization.ByteArrayDeserializer;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.nio.charset.StandardCharsets;
@@ -22,27 +23,28 @@ public class DlqConsumer {
   KafkaConsumer<byte[], byte[]> consumer;
   private final ObjectMapper objectMapper;
 
-  public void runConsumer() {
+  private final kafkaConfig kafkaConfig;
 
-    String bootstrapServers = "msk-kfk-common-01.test.tui-dx.com:9092,msk-kfk-common-02.test.tui-dx.com:9092";
-    String groupId = "dlq-consumer-task";
-    String topic = "transfer.booking.event";
+  @Value("${spring.kafka.topics}")
+  private List<String> topics;
+
+  public void runConsumer() {
 
     // create consumer configs
     Properties properties = new Properties();
-    properties.setProperty(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
-    properties.setProperty(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
-    properties.setProperty(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, ByteArrayDeserializer.class.getName());
-    properties.setProperty(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, ByteArrayDeserializer.class.getName());
-    properties.setProperty(ConsumerConfig.GROUP_ID_CONFIG, groupId);
-    properties.setProperty(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "latest");
+    properties.setProperty(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, kafkaConfig.getEnableAutoCommit());
+    properties.setProperty(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, kafkaConfig.getBootstrapServers());
+    properties.setProperty(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG,kafkaConfig.getKeyDeserializer());
+    properties.setProperty(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, kafkaConfig.getValueDeserializer());
+    properties.setProperty(ConsumerConfig.GROUP_ID_CONFIG, kafkaConfig.getGroupId());
+    properties.setProperty(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, kafkaConfig.getAutoOffsetReset());
 
     consumer = new KafkaConsumer<>(properties);
 
     try {
 
-      consumer.subscribe(List.of(topic));
-      var topicPartitions = getPartitionList(consumer, topic);
+      consumer.subscribe(topics);
+      var topicPartitions = getPartitionList(consumer, topics.get(0));
 
       boolean running = true;
 
