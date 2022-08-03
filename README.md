@@ -34,18 +34,29 @@ Fist step is configure your service and the Gitlab project to allow it to be dep
 
 ### Configure the project
 
-The next environment variables can be configured:
+The only variable that depends on the environment is the BOOTSTRAP_SERVERS, so you need to set that in the task definition in the IaC project.
+To run this locally you can set a default value as it's shown below:
 
-* BOOTSTRAP_SERVERS
-* GROUP_ID
-* TOPIC
+      bootstrap-servers: ${BOOTSTRAP_SERVERS:localhost:9092}
 
-If they are not defined, the service will use the ones configured by default.
+On the other hand, you need to set the rest of variables related to kafka directly in the application.yml:
+
+```
+ kafka:
+  topics: foo
+  consumer:
+  auto-offset-reset: latest
+  bootstrap-servers: ${BOOTSTRAP_SERVERS:localhost:9092}
+  group-id: ${spring.application.name}
+  enable-auto-commit: false
+  value-deserializer: org.apache.kafka.common.serialization.ByteArrayDeserializer
+  key-deserializer: org.apache.kafka.common.serialization.ByteArrayDeserializer`
+```
 
 ### Configure Gitlab Project
 
-Because the pipeline allows execution for multiple environments, the configuration parameters also must be by each 
-environment you need to deploy.
+Due to the pipeline allows execution for multiple environments, configuration parameters must also be set for each environment that needs to be deployed.
+
 The Gitlab CI/CD pipeline require the following parameters to be fully executed according the environment:
 
 | Environment Variable                  | Description |
@@ -54,17 +65,21 @@ The Gitlab CI/CD pipeline require the following parameters to be fully executed 
 | **\<ENVIRONMENT>_AWS_SUBNET**         | To run Fargate job you must specify a subnet list | 
 | **\<ENVIRONMENT>_AWS_SECURITY_GROUP** | A security group list is required To run Fargate tasks | 
 
-Where the <ENVIRONMENT> typically can take this values: TEST, PRE, PROD.
+* The ENVIRONMENT can typically be set to: TEST, PRE, PROD.
 
 ### Pipelines
 
-Has been configured a `gitlab-ci` with two pipeline flows: 
+It has been configured a `gitlab-ci` with two pipeline flows: 
 
-* One of them to package your Java code and build the docker image, update the AWS task definition  deployed by 
-  [IaC project](https://source.tui/dx/fulfillment/ermes/iac-kafka-dlq-consumer-task) with the docker image generated 
-  by the previous job and run optionally the AWS Fargate task. This pipeline is enabled for each push to the repository.
-  ![Full pipeline](assets/pipeline_1.png)
-* The other one runs automatically the AWS Fargate task. This pipeline is only activated using the web interface. 
+* There is one flow intended to update the AWS Fargate task definition deployed by 
+  [IaC project](https://source.tui/dx/fulfillment/ermes/iac-kafka-dlq-consumer-task)  
+  Optionally, you can manually run the recently updated Fargate task with a last step as it's described in the  picture bellow. 
+  This pipeline is triggered from branch you push commit.
+
+    ![Full pipeline](assets/pipeline_1.png)
+
+* There is  a second flow that just runs automatically the AWS Fargate task. This pipeline is only activated using Gitlab web interface.
+
   ![Full pipeline](assets/pipeline_2.png)
 
 
